@@ -9,3 +9,5 @@ wget https://github.com/P3TERX/GeoLite.mmdb/releases/download/2025.02.25/GeoLite
 
 for free database Geolite could you check here https://github.com/P3TERX/GeoLite.mmdb/releases
 
+Thanks https://github.com/P3TERX
+
