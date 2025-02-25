@@ -38,7 +38,7 @@ def parse_log_entry(log_entry):
 
 # Fungsi untuk mengekstrak nama channel dari path
 def extract_channel_name(path):
-    match = re.search(r'\/([^\/]+)\/tracks-v1a1\/mono\.m3u8', path)
+    match = re.search(r'\/([^\/]+)\/tracks-v1a1(?:\/|a2\/)/mono\.m3u8', path)
     if match:
         return match.group(1)
     return None
