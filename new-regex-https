@@ -1,0 +1,201 @@
+# Support monitoring request data ssl 
+untuk update ini sudah include http dan https.
+import subprocess
+import re
+from collections import defaultdict
+import time
+import geoip2.database
+
+# Configuration
+LOG_FILE = "/var/log/nginx/access.log"
+GEOIP_DB_PATH = "/usr/local/share/GeoIP/GeoLite2-City.mmdb"
+BYTES_TO_MBITS = 8 / 1_000_000
+METRICS_FILE = "/var/www/html/metrics"
+UPDATE_INTERVAL = 5  # seconds
+
+# Initialize GeoIP reader
+geoip_reader = geoip2.database.Reader(GEOIP_DB_PATH)
+
+# Track IP activity
+ip_activity = defaultdict(lambda: {'last_seen': 0, 'active': False, 'bandwidth': 0})
+
+def tail_log_file():
+    """Tail the Nginx log file continuously"""
+    process = subprocess.Popen(['tail', '-F', LOG_FILE], 
+                             stdout=subprocess.PIPE, 
+                             stderr=subprocess.PIPE)
+    while True:
+        line = process.stdout.readline()
+        if line:
+            yield line
+        else:
+            time.sleep(0.1)
+
+def parse_log_entry(log_entry):
+    """Parse log entry with support for both HTTP and HTTPS"""
+    # Updated pattern to handle:
+    # - Both HTTP and HTTPS protocols
+    # - Different HTTP versions (1.0, 1.1)
+    # - Various request methods
+    pattern = (
+        r'^(?P<ip>\d+\.\d+\.\d+\.\d+)\s-\s-\s\[.*?\]\s'
+        r'"(?P<method>\w+)\s(?P<url>.+?)\sHTTP/\d\.\d"\s'
+        r'(?P<status>\d+)\s(?P<bytes>\d+)'
+    )
+    
+    try:
+        decoded_entry = log_entry.decode('utf-8')
+        match = re.match(pattern, decoded_entry)
+        if match:
+            # Extract the path from URL (handles both http:// and https://)
+            url = match.group('url')
+            if url.startswith(('http://', 'https://')):
+                # Remove protocol and domain
+                path = '/' + '/'.join(url.split('/')[3:])
+            else:
+                path = url
+            
+            return (
+                match.group('ip'),
+                path,
+                int(match.group('bytes')),
+                match.group('method')
+            )
+    except Exception as e:
+        print(f"Error parsing log entry: {e}")
+    
+    return None, None, 0, None
+
+def extract_channel_name(path):
+    """Extract channel name from path (works for both HTTP and HTTPS)"""
+    patterns = [
+        r'\/([^\/]+)\/tracks-v1a\d+(?:\/|a\d+\/)mono\.m3u8',
+        r'\/([^\/]+)\/index\.mpd',
+        r'\/([^\/]+)\/mpegts',
+        r'\/([^\/]+)\/.*\.m3u8',
+        r'\/([^\/]+)\/.*\.ts'
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, path)
+        if match:
+            return match.group(1)
+    return None
+
+def get_geoip_info(ip):
+    """Get GeoIP information for an IP address"""
+    try:
+        response = geoip_reader.city(ip)
+        return (
+            response.country.name or "Unknown",
+            response.city.name or "Unknown",
+            response.location.latitude or 0,
+            response.location.longitude or 0
+        )
+    except Exception as e:
+        print(f"GeoIP error for {ip}: {e}")
+        return "Unknown", "Unknown", 0, 0
+
+def write_metrics(metrics, current_time):
+    """Write all metrics to the metrics file"""
+    try:
+        with open(METRICS_FILE, 'w') as f:
+            # IP request counts
+            f.write('# HELP nginx_ip_request_count Total requests per IP\n')
+            f.write('# TYPE nginx_ip_request_count counter\n')
+            for ip, count in metrics['ip_requests'].items():
+                f.write(f'nginx_ip_request_count{{ip="{ip}"}} {count}\n')
+            
+            # IP bandwidth
+            f.write('\n# HELP nginx_ip_bandwidth Bandwidth per IP (Mbps)\n')
+            f.write('# TYPE nginx_ip_bandwidth gauge\n')
+            for ip, data in metrics['ip_bandwidth'].items():
+                country, city, lat, lon = get_geoip_info(ip)
+                bandwidth_mbps = (data['bytes'] / UPDATE_INTERVAL) * BYTES_TO_MBITS
+                f.write(
+                    f'nginx_ip_bandwidth{{ip="{ip}",country="{country}",'
+                    f'city="{city}",latitude="{lat}",longitude="{lon}"}} '
+                    f'{bandwidth_mbps}\n'
+                )
+            
+            # Channel traffic
+            f.write('\n# HELP nginx_channel_traffic IPs per channel\n')
+            f.write('# TYPE nginx_channel_traffic gauge\n')
+            for channel, ips in metrics['channel_access'].items():
+                f.write(f'nginx_channel_traffic{{channel="{channel}"}} {len(ips)}\n')
+                for ip in ips:
+                    country, city, lat, lon = get_geoip_info(ip)
+                    f.write(
+                        f'nginx_channel_ip_access{{channel="{channel}",ip="{ip}",'
+                        f'country="{country}",city="{city}",latitude="{lat}",'
+                        f'longitude="{lon}"}} 1\n'
+                    )
+    except Exception as e:
+        print(f"Error writing metrics: {e}")
+
+def monitor_nginx_traffic():
+    """Main monitoring function"""
+    print(f"Monitoring Nginx traffic from {LOG_FILE}...")
+    
+    metrics = {
+        'ip_requests': defaultdict(int),
+        'ip_bandwidth': defaultdict(lambda: {'bytes': 0}),
+        'channel_traffic': defaultdict(int),
+        'channel_access': defaultdict(set)
+    }
+    
+    last_update = time.time()
+    
+    try:
+        for log_entry in tail_log_file():
+            ip, path, bytes_transferred, method = parse_log_entry(log_entry)
+            current_time = time.time()
+            
+            if ip:
+                # Update IP activity
+                if not ip_activity[ip]['active']:
+                    ip_activity[ip]['active'] = True
+                    ip_activity[ip]['bandwidth'] = 0
+                    # Initialize with 0 bandwidth
+                    metrics['ip_bandwidth'][ip]['bytes'] = 0
+                
+                # Update metrics
+                metrics['ip_requests'][ip] += 1
+                metrics['ip_bandwidth'][ip]['bytes'] += bytes_transferred
+                ip_activity[ip]['last_seen'] = current_time
+                ip_activity[ip]['bandwidth'] += bytes_transferred
+                
+                # Extract channel name if applicable
+                channel_name = extract_channel_name(path)
+                if channel_name:
+                    metrics['channel_access'][channel_name].add(ip)
+            
+            # Periodic update
+            if current_time - last_update >= UPDATE_INTERVAL:
+                # Check for inactive IPs
+                for ip in list(ip_activity.keys()):
+                    if current_time - ip_activity[ip]['last_seen'] > UPDATE_INTERVAL:
+                        if ip_activity[ip]['active']:
+                            metrics['ip_bandwidth'][ip]['bytes'] = 0
+                            ip_activity[ip]['active'] = False
+                
+                # Write metrics
+                write_metrics(metrics, current_time)
+                
+                # Reset metrics
+                metrics['ip_requests'].clear()
+                for ip in metrics['ip_bandwidth']:
+                    metrics['ip_bandwidth'][ip]['bytes'] = 0
+                metrics['channel_access'].clear()
+                
+                last_update = current_time
+    
+    except KeyboardInterrupt:
+        print("\nMonitoring stopped.")
+    except Exception as e:
+        print(f"Monitoring error: {e}")
+    finally:
+        geoip_reader.close()
+
+if __name__ == "__main__":
+    monitor_nginx_traffic()
