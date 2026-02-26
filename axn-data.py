@@ -3,6 +3,7 @@ import re
 from collections import defaultdict
 import time
 import geoip2.database
+import geoip2.errors
 
 # Configuration
 LOG_FILE = "/var/log/nginx/access.log"
@@ -14,8 +15,8 @@ UPDATE_INTERVAL = 5  # seconds
 INACTIVITY_TIMEOUT = 3600  # seconds
 
 # Initialize GeoIP readers
-geoip_city_reader = geoip2.database.Reader(GEOIP_CITY_DB_PATH)
-geoip_asn_reader = geoip2.database.Reader(GEOIP_ASN_DB_PATH)
+city_reader = geoip2.database.Reader(GEOIP_CITY_DB_PATH)
+asn_reader = geoip2.database.Reader(GEOIP_ASN_DB_PATH)
 
 # Track IP activity
 ip_activity = defaultdict(lambda: {'last_seen': 0, 'active': False, 'bandwidth': 0})
@@ -34,8 +35,10 @@ def tail_log_file():
 
 def parse_log_entry(log_entry):
     """Parse log entry with support for both HTTP and HTTPS"""
-    # Pola regex yang lebih robust untuk format log Nginx standar
-    # $remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent"
+    # Updated pattern to handle:
+    # - Both HTTP and HTTPS protocols
+    # - Different HTTP versions (1.0, 1.1)
+    # - Various request methods
     pattern = (
         r'^(?P<ip>\d+\.\d+\.\d+\.\d+)\s-\s-\s\[.*?\]\s'
         r'"(?P<method>\w+)\s(?P<url>.+?)\sHTTP/\d\.\d"\s'
@@ -46,10 +49,10 @@ def parse_log_entry(log_entry):
         decoded_entry = log_entry.decode('utf-8')
         match = re.match(pattern, decoded_entry)
         if match:
+            # Extract the path from URL (handles both http:// and https://)
             url = match.group('url')
-            # Jika URL sudah memiliki protokol, ekstrak hanya path-nya
             if url.startswith(('http://', 'https://')):
-                # Remove protocol and domain, keep path only
+                # Remove protocol and domain
                 path = '/' + '/'.join(url.split('/')[3:])
             else:
                 path = url
@@ -65,63 +68,65 @@ def parse_log_entry(log_entry):
 
     return None, None, 0, None
 
-def extract_server_origin_and_channel(path):
-    """
-    Extract server origin and channel name from URL path.
-    Example path: /astra-cibi/local/play/channel4/index.m3u8
-    Returns tuple (server_origin, channel_name)
-    """
-    # Regex untuk menangkap server origin (segmen pertama)
-    # dan channel name (segmen setelah server origin dan subfolder opsional)
-    pattern = (
-        r'^\/(?P<server_origin>[^\/]+)\/'                  # server origin
-        r'(?:local\/)?'                                    # optional 'local/'
-        r'(?:play\/)?'                                     # optional 'play/'
-        r'(?P<channel>[^\/\.]+)'                          # channel name (exclude extensions)
-    )
+def extract_channel_name(path):
+    """Extract channel name from path (supports m3u8, mpegts, and mpd)"""
+    patterns = [
+        r'\/([^\/]+)\/tracks-v1a\d+(?:\/|a\d+\/)mono\.m3u8',  # HLS tracks
+        r'\/([^\/]+)\/index\.mpd',  # DASH manifest
+        r'\/([^\/]+)\/mpegts',  # MPEG-TS stream
+        r'\/([^\/]+)\/.*\.m3u8',  # Any HLS manifest
+        r'\/([^\/]+)\/.*\.ts',  # HLS segments
+        r'\/([^\/]+)\/.*\.mpd',  # Any DASH manifest
+        r'\/([^\/]+)\/.*\.m4s',  # DASH segments
+        r'\/([^\/]+)\/.*\.mp4'  # MP4 segments
+    ]
 
-    match = re.match(pattern, path)
-    if match:
-        return match.group('server_origin'), match.group('channel')
-    return None, None
+    for pattern in patterns:
+        match = re.search(pattern, path)
+        if match:
+            return match.group(1)
+    
+    # Also check for channel name in path with common streaming patterns
+    path_parts = path.split('/')
+    if len(path_parts) > 1:
+        # Look for potential channel name (between slashes)
+        for part in path_parts:
+            if part and not part.endswith(('.m3u8', '.ts', '.mpd', '.m4s', '.mp4')):
+                # Check if it might be a channel name (alphanumeric and common separators)
+                if re.match(r'^[a-zA-Z0-9_-]+$', part):
+                    return part
+    
+    return None
 
-def get_geoip_info(ip):
-    """Get GeoIP information for an IP address (City + ASN)"""
-    country = "Unknown"
-    city = "Unknown"
-    lat = 0
-    lon = 0
-    asn_number = 0
-    asn_organization = "Unknown"
-    isp = "Unknown"
-
+def get_geoip_city_info(ip):
+    """Get GeoIP city information for an IP address"""
     try:
-        # Get City information
-        response_city = geoip_city_reader.city(ip)
-        country = response_city.country.name if response_city.country.name else "Unknown"
-        city = response_city.city.name if response_city.city.name else "Unknown"
-        lat = response_city.location.latitude if response_city.location.latitude else 0
-        lon = response_city.location.longitude if response_city.location.longitude else 0
-
-        # Get ASN information
-        response_asn = geoip_asn_reader.asn(ip)
-        asn_number = response_asn.autonomous_system_number if response_asn.autonomous_system_number else 0
-        asn_organization = response_asn.autonomous_system_organization if response_asn.autonomous_system_organization else "Unknown"
-
-        # ISP bisa diambil dari ASN organization atau dari database lain
-        isp = asn_organization
-
+        response = city_reader.city(ip)
+        return (
+            response.country.name or "Unknown",
+            response.city.name or "Unknown",
+            response.location.latitude or 0,
+            response.location.longitude or 0
+        )
+    except geoip2.errors.AddressNotFoundError:
+        return "Unknown", "Unknown", 0, 0
     except Exception as e:
-        print(f"GeoIP error for {ip}: {e}")
+        print(f"GeoIP City error for {ip}: {e}")
+        return "Unknown", "Unknown", 0, 0
 
-    return country, city, lat, lon, asn_number, asn_organization, isp
-
-def sanitize_label_value(value):
-    """Sanitize label values for Prometheus metrics"""
-    if value is None:
-        return "unknown"
-    # Escape backslashes, double quotes, and newlines
-    return str(value).replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+def get_geoip_asn_info(ip):
+    """Get GeoIP ASN information for an IP address"""
+    try:
+        response = asn_reader.asn(ip)
+        return (
+            response.autonomous_system_number or 0,
+            response.autonomous_system_organization or "Unknown"
+        )
+    except geoip2.errors.AddressNotFoundError:
+        return 0, "Unknown"
+    except Exception as e:
+        print(f"GeoIP ASN error for {ip}: {e}")
+        return 0, "Unknown"
 
 def write_metrics(metrics, current_time):
     """Write all metrics to the metrics file"""
@@ -131,214 +136,63 @@ def write_metrics(metrics, current_time):
             f.write('# HELP nginx_ip_request_count Total requests per IP\n')
             f.write('# TYPE nginx_ip_request_count counter\n')
             for ip, count in metrics['ip_requests'].items():
-                sanitized_ip = sanitize_label_value(ip)
-                f.write(f'nginx_ip_request_count{{ip="{sanitized_ip}"}} {count}\n')
+                f.write(f'nginx_ip_request_count{{ip="{ip}"}} {count}\n')
 
-            # IP bandwidth - filter inactive IPs
+            # IP bandwidth with City and ASN info
             f.write('\n# HELP nginx_ip_bandwidth Bandwidth per IP (Mbps)\n')
             f.write('# TYPE nginx_ip_bandwidth gauge\n')
+            active_ips = {ip: data for ip, data in metrics['ip_bandwidth'].items()
+                         if ip in ip_activity and
+                         (current_time - ip_activity[ip]['last_seen']) <= INACTIVITY_TIMEOUT}
 
-            # Hanya hitung bandwidth untuk IP yang aktif
-            for ip, data in metrics['ip_bandwidth'].items():
-                if ip in ip_activity:
-                    time_since_last_seen = current_time - ip_activity[ip]['last_seen']
-                    if time_since_last_seen <= INACTIVITY_TIMEOUT and data['bytes'] > 0:
-                        bandwidth_mbps = (data['bytes'] / UPDATE_INTERVAL) * BYTES_TO_MBITS
-                        country, city, lat, lon, asn_number, asn_organization, isp = get_geoip_info(ip)
+            for ip, data in active_ips.items():
+                country, city, lat, lon = get_geoip_city_info(ip)
+                asn_number, asn_org = get_geoip_asn_info(ip)
+                bandwidth_mbps = (data['bytes'] / UPDATE_INTERVAL) * BYTES_TO_MBITS
+                f.write(
+                    f'nginx_ip_bandwidth{{ip="{ip}",country="{country}",'
+                    f'city="{city}",latitude="{lat}",longitude="{lon}",'
+                    f'asn="{asn_number}",asn_org="{asn_org}"}} '
+                    f'{bandwidth_mbps}\n'
+                )
 
-                        sanitized_ip = sanitize_label_value(ip)
-                        sanitized_country = sanitize_label_value(country)
-                        sanitized_city = sanitize_label_value(city)
-                        sanitized_asn_org = sanitize_label_value(asn_organization)
-                        sanitized_isp = sanitize_label_value(isp)
-
-                        f.write(
-                            f'nginx_ip_bandwidth{{ip="{sanitized_ip}",country="{sanitized_country}",'
-                            f'city="{sanitized_city}",asn="{asn_number}",asn_org="{sanitized_asn_org}",'
-                            f'isp="{sanitized_isp}",latitude="{lat}",longitude="{lon}"}} '
-                            f'{bandwidth_mbps:.6f}\n'
-                        )
-
-            # Channel bandwidth - ditambahkan
-            f.write('\n# HELP nginx_channel_bandwidth Bandwidth per channel (Mbps)\n')
-            f.write('# TYPE nginx_channel_bandwidth gauge\n')
-
-            # Hitung total bandwidth per channel
-            channel_bandwidth_totals = defaultdict(float)
-            channel_server_origin_bandwidth = defaultdict(lambda: defaultdict(float))
-
-            # Kumpulkan bandwidth per channel
-            for (server_origin, channel), data in metrics['channel_server_origin_bandwidth'].items():
-                # Hanya hitung untuk channel yang memiliki traffic aktif
-                active_ips = {ip for ip in data['ips'] if ip in ip_activity and
-                             (current_time - ip_activity[ip]['last_seen']) <= INACTIVITY_TIMEOUT}
-
-                if active_ips and data['bytes'] > 0:
-                    bandwidth_mbps = (data['bytes'] / UPDATE_INTERVAL) * BYTES_TO_MBITS
-                    channel_bandwidth_totals[channel] += bandwidth_mbps
-                    channel_server_origin_bandwidth[channel][server_origin] += bandwidth_mbps
-
-            # Tulis bandwidth total per channel
-            for channel, bandwidth in channel_bandwidth_totals.items():
-                sanitized_channel = sanitize_label_value(channel)
-                f.write(f'nginx_channel_bandwidth{{channel="{sanitized_channel}"}} {bandwidth:.6f}\n')
-
-            # Bandwidth per channel dengan server_origin
-            f.write('\n# HELP nginx_channel_server_origin_bandwidth Bandwidth per channel with server origin (Mbps)\n')
-            f.write('# TYPE nginx_channel_server_origin_bandwidth gauge\n')
-
-            for channel, server_origins in channel_server_origin_bandwidth.items():
-                for server_origin, bandwidth in server_origins.items():
-                    if bandwidth > 0:
-                        sanitized_channel = sanitize_label_value(channel)
-                        sanitized_server_origin = sanitize_label_value(server_origin)
-                        f.write(f'nginx_channel_server_origin_bandwidth{{channel="{sanitized_channel}",server_origin="{sanitized_server_origin}"}} {bandwidth:.6f}\n')
-
-            # Channel traffic - dengan server_origin
+            # Channel traffic
             f.write('\n# HELP nginx_channel_traffic IPs per channel\n')
             f.write('# TYPE nginx_channel_traffic gauge\n')
-
-            # Struktur untuk menyimpan channel dengan server_origin yang sesuai
-            channel_metrics = defaultdict(lambda: {'ips': set(), 'server_origin': defaultdict(set)})
-
-            # Kumpulkan data channel dengan server_origin
-            for (server_origin, channel), ips in metrics['channel_server_origin_access'].items():
-                channel_metrics[channel]['ips'].update(ips)
+            for channel, ips in metrics['channel_access'].items():
+                f.write(f'nginx_channel_traffic{{channel="{channel}"}} {len(ips)}\n')
                 for ip in ips:
-                    channel_metrics[channel]['server_origin'][server_origin].add(ip)
+                    country, city, lat, lon = get_geoip_city_info(ip)
+                    asn_number, asn_org = get_geoip_asn_info(ip)
+                    f.write(
+                        f'nginx_channel_ip_access{{channel="{channel}",ip="{ip}",'
+                        f'country="{country}",city="{city}",latitude="{lat}",'
+                        f'longitude="{lon}",asn="{asn_number}",asn_org="{asn_org}"}} 1\n'
+                    )
 
-            for channel, data in channel_metrics.items():
-                # Filter hanya IP yang aktif
-                active_ips = {ip for ip in data['ips'] if ip in ip_activity and
-                             (current_time - ip_activity[ip]['last_seen']) <= INACTIVITY_TIMEOUT}
+            # Summary metrics
+            f.write('\n# HELP nginx_total_active_ips Total active IPs\n')
+            f.write('# TYPE nginx_total_active_ips gauge\n')
+            f.write(f'nginx_total_active_ips {len(active_ips)}\n')
 
-                if active_ips:
-                    sanitized_channel = sanitize_label_value(channel)
-                    f.write(f'nginx_channel_traffic{{channel="{sanitized_channel}"}} {len(active_ips)}\n')
+            f.write('\n# HELP nginx_total_active_channels Total active channels\n')
+            f.write('# TYPE nginx_total_active_channels gauge\n')
+            f.write(f'nginx_total_active_channels {len(metrics["channel_access"])}\n')
 
-            # Channel IP access dengan server_origin (dengan info ASN)
-            f.write('\n# HELP nginx_channel_ip_access IP access per channel with server origin and ASN info\n')
-            f.write('# TYPE nginx_channel_ip_access gauge\n')
-
-            for (server_origin, channel), ips in metrics['channel_server_origin_access'].items():
-                # Filter hanya IP yang aktif
-                active_ips = {ip for ip in ips if ip in ip_activity and
-                             (current_time - ip_activity[ip]['last_seen']) <= INACTIVITY_TIMEOUT}
-
-                if active_ips:
-                    sanitized_channel = sanitize_label_value(channel)
-                    sanitized_server_origin = sanitize_label_value(server_origin)
-
-                    for ip in active_ips:
-                        country, city, lat, lon, asn_number, asn_organization, isp = get_geoip_info(ip)
-                        sanitized_ip = sanitize_label_value(ip)
-                        sanitized_country = sanitize_label_value(country)
-                        sanitized_city = sanitize_label_value(city)
-                        sanitized_asn_org = sanitize_label_value(asn_organization)
-                        sanitized_isp = sanitize_label_value(isp)
-
-                        f.write(
-                            f'nginx_channel_ip_access{{channel="{sanitized_channel}",'
-                            f'server_origin="{sanitized_server_origin}",ip="{sanitized_ip}",'
-                            f'country="{sanitized_country}",city="{sanitized_city}",asn="{asn_number}",'
-                            f'asn_org="{sanitized_asn_org}",isp="{sanitized_isp}",latitude="{lat}",'
-                            f'longitude="{lon}"}} 1\n'
-                        )
-
-            # Server origin traffic
-            f.write('\n# HELP nginx_server_origin_traffic IPs per server_origin\n')
-            f.write('# TYPE nginx_server_origin_traffic gauge\n')
-            for server_origin, ips in metrics['server_origin_access'].items():
-                # Filter hanya IP yang aktif
-                active_ips = {ip for ip in ips if ip in ip_activity and
-                             (current_time - ip_activity[ip]['last_seen']) <= INACTIVITY_TIMEOUT}
-                if active_ips:
-                    sanitized_server_origin = sanitize_label_value(server_origin)
-                    f.write(f'nginx_server_origin_traffic{{server_origin="{sanitized_server_origin}"}} {len(active_ips)}\n')
-
-            # Server origin bandwidth
-            f.write('\n# HELP nginx_server_origin_bandwidth Bandwidth per server origin (Mbps)\n')
-            f.write('# TYPE nginx_server_origin_bandwidth gauge\n')
-
-            for server_origin, data in metrics['server_origin_bandwidth'].items():
-                # Filter hanya IP yang aktif
-                active_ips = {ip for ip in data['ips'] if ip in ip_activity and
-                             (current_time - ip_activity[ip]['last_seen']) <= INACTIVITY_TIMEOUT}
-
-                if active_ips and data['bytes'] > 0:
-                    bandwidth_mbps = (data['bytes'] / UPDATE_INTERVAL) * BYTES_TO_MBITS
-                    sanitized_server_origin = sanitize_label_value(server_origin)
-                    f.write(f'nginx_server_origin_bandwidth{{server_origin="{sanitized_server_origin}"}} {bandwidth_mbps:.6f}\n')
-
-            # Server origin IP access (dengan info ASN)
-            f.write('\n# HELP nginx_server_origin_ip_access IP access per server origin with ASN info\n')
-            f.write('# TYPE nginx_server_origin_ip_access gauge\n')
-            for server_origin, ips in metrics['server_origin_access'].items():
-                # Filter hanya IP yang aktif
-                active_ips = {ip for ip in ips if ip in ip_activity and
-                             (current_time - ip_activity[ip]['last_seen']) <= INACTIVITY_TIMEOUT}
-
-                if active_ips:
-                    sanitized_server_origin = sanitize_label_value(server_origin)
-
-                    for ip in active_ips:
-                        country, city, lat, lon, asn_number, asn_organization, isp = get_geoip_info(ip)
-                        sanitized_ip = sanitize_label_value(ip)
-                        sanitized_country = sanitize_label_value(country)
-                        sanitized_city = sanitize_label_value(city)
-                        sanitized_asn_org = sanitize_label_value(asn_organization)
-                        sanitized_isp = sanitize_label_value(isp)
-
-                        f.write(
-                            f'nginx_server_origin_ip_access{{server_origin="{sanitized_server_origin}",ip="{sanitized_ip}",'
-                            f'country="{sanitized_country}",city="{sanitized_city}",asn="{asn_number}",'
-                            f'asn_org="{sanitized_asn_org}",isp="{sanitized_isp}",latitude="{lat}",'
-                            f'longitude="{lon}"}} 1\n'
-                        )
-
-            # ASN-specific metrics
+            # ASN-based bandwidth aggregation
             f.write('\n# HELP nginx_asn_bandwidth Bandwidth per ASN (Mbps)\n')
             f.write('# TYPE nginx_asn_bandwidth gauge\n')
-
-            # Hitung bandwidth per ASN
             asn_bandwidth = defaultdict(float)
-            asn_ip_count = defaultdict(set)
-
-            for ip, data in metrics['ip_bandwidth'].items():
-                if ip in ip_activity:
-                    time_since_last_seen = current_time - ip_activity[ip]['last_seen']
-                    if time_since_last_seen <= INACTIVITY_TIMEOUT and data['bytes'] > 0:
-                        country, city, lat, lon, asn_number, asn_organization, isp = get_geoip_info(ip)
-                        if asn_number > 0:
-                            bandwidth_mbps = (data['bytes'] / UPDATE_INTERVAL) * BYTES_TO_MBITS
-                            asn_bandwidth[asn_number] += bandwidth_mbps
-                            asn_ip_count[asn_number].add(ip)
-
-            for asn_number, bandwidth in asn_bandwidth.items():
-                # Coba dapatkan info ASN dari IP pertama
-                sample_ip = next(iter(asn_ip_count[asn_number])) if asn_ip_count[asn_number] else None
-                if sample_ip:
-                    country, city, lat, lon, _, asn_organization, isp = get_geoip_info(sample_ip)
-                    sanitized_asn_org = sanitize_label_value(asn_organization)
-                    sanitized_isp = sanitize_label_value(isp)
-
-                    f.write(f'nginx_asn_bandwidth{{asn="{asn_number}",asn_org="{sanitized_asn_org}",isp="{sanitized_isp}"}} {bandwidth:.6f}\n')
-
-            # ASN IP count
-            f.write('\n# HELP nginx_asn_ip_count Number of unique IPs per ASN\n')
-            f.write('# TYPE nginx_asn_ip_count gauge\n')
-
-            for asn_number, ips in asn_ip_count.items():
-                active_ips = {ip for ip in ips if ip in ip_activity and
-                             (current_time - ip_activity[ip]['last_seen']) <= INACTIVITY_TIMEOUT}
-
-                if active_ips:
-                    sample_ip = next(iter(active_ips))
-                    country, city, lat, lon, _, asn_organization, isp = get_geoip_info(sample_ip)
-                    sanitized_asn_org = sanitize_label_value(asn_organization)
-                    sanitized_isp = sanitize_label_value(isp)
-
-                    f.write(f'nginx_asn_ip_count{{asn="{asn_number}",asn_org="{sanitized_asn_org}",isp="{sanitized_isp}"}} {len(active_ips)}\n')
+            for ip, data in active_ips.items():
+                asn_number, asn_org = get_geoip_asn_info(ip)
+                bandwidth_mbps = (data['bytes'] / UPDATE_INTERVAL) * BYTES_TO_MBITS
+                asn_bandwidth[(asn_number, asn_org)] += bandwidth_mbps
+            
+            for (asn_number, asn_org), bandwidth in asn_bandwidth.items():
+                f.write(
+                    f'nginx_asn_bandwidth{{asn="{asn_number}",asn_org="{asn_org}"}} '
+                    f'{bandwidth}\n'
+                )
 
     except Exception as e:
         print(f"Error writing metrics: {e}")
@@ -346,16 +200,15 @@ def write_metrics(metrics, current_time):
 def monitor_nginx_traffic():
     """Main monitoring function"""
     print(f"Monitoring Nginx traffic from {LOG_FILE}...")
+    print(f"Using GeoIP City DB: {GEOIP_CITY_DB_PATH}")
+    print(f"Using GeoIP ASN DB: {GEOIP_ASN_DB_PATH}")
+    print(f"Metrics will be written to: {METRICS_FILE}")
 
     metrics = {
         'ip_requests': defaultdict(int),
         'ip_bandwidth': defaultdict(lambda: {'bytes': 0}),
-        'channel_access': defaultdict(set),  # Untuk backward compatibility
-        'server_origin_access': defaultdict(set),
-        'channel_server_origin_access': defaultdict(set),  # Untuk menggabungkan channel dan server_origin
-        'channel_server_origin_bandwidth': defaultdict(lambda: {'bytes': 0, 'ips': set()}),  # Bandwidth per channel dengan server_origin
-        'server_origin_bandwidth': defaultdict(lambda: {'bytes': 0, 'ips': set()}),  # Bandwidth per server_origin
-        'channel_bandwidth': defaultdict(lambda: {'bytes': 0, 'ips': set()})  # Bandwidth per channel (total)
+        'channel_traffic': defaultdict(int),
+        'channel_access': defaultdict(set)
     }
 
     last_update = time.time()
@@ -366,96 +219,52 @@ def monitor_nginx_traffic():
             ip, path, bytes_transferred, method = parse_log_entry(log_entry)
             current_time = time.time()
 
-            if ip and path:
+            if ip:
                 # Update IP activity
                 if not ip_activity[ip]['active']:
                     ip_activity[ip]['active'] = True
                     ip_activity[ip]['bandwidth'] = 0
-                    # Pastikan entry ada di metrics['ip_bandwidth']
-                    if ip not in metrics['ip_bandwidth']:
-                        metrics['ip_bandwidth'][ip] = {'bytes': 0}
+                    # Initialize with 0 bandwidth
+                    metrics['ip_bandwidth'][ip]['bytes'] = 0
 
+                # Update metrics
                 metrics['ip_requests'][ip] += 1
                 metrics['ip_bandwidth'][ip]['bytes'] += bytes_transferred
                 ip_activity[ip]['last_seen'] = current_time
                 ip_activity[ip]['bandwidth'] += bytes_transferred
 
-                # Extract server origin and channel name
-                server_origin, channel_name = extract_server_origin_and_channel(path)
-
+                # Extract channel name if applicable (now supports .mpd)
+                channel_name = extract_channel_name(path)
                 if channel_name:
                     metrics['channel_access'][channel_name].add(ip)
-                    # Update bandwidth per channel
-                    metrics['channel_bandwidth'][channel_name]['bytes'] += bytes_transferred
-                    metrics['channel_bandwidth'][channel_name]['ips'].add(ip)
-
-                if server_origin:
-                    metrics['server_origin_access'][server_origin].add(ip)
-                    # Update bandwidth per server_origin
-                    metrics['server_origin_bandwidth'][server_origin]['bytes'] += bytes_transferred
-                    metrics['server_origin_bandwidth'][server_origin]['ips'].add(ip)
-
-                # Gabungkan channel dan server_origin untuk access dan bandwidth
-                if server_origin and channel_name:
-                    # Untuk access
-                    key_access = (server_origin, channel_name)
-                    metrics['channel_server_origin_access'][key_access].add(ip)
-
-                    # Untuk bandwidth
-                    key_bandwidth = (server_origin, channel_name)
-                    metrics['channel_server_origin_bandwidth'][key_bandwidth]['bytes'] += bytes_transferred
-                    metrics['channel_server_origin_bandwidth'][key_bandwidth]['ips'].add(ip)
+                    if path.endswith('.mpd'):
+                        print(f"DASH stream detected: Channel {channel_name} from IP {ip}")
 
             # Periodic update
             if current_time - last_update >= UPDATE_INTERVAL:
-                # Check for inactive IPs dalam interval update
-                for ip, data in list(ip_activity.items()):
-                    if current_time - data['last_seen'] > UPDATE_INTERVAL:
-                        if data['active']:
-                            # Reset bandwidth untuk IP yang tidak aktif
-                            if ip in metrics['ip_bandwidth']:
-                                metrics['ip_bandwidth'][ip]['bytes'] = 0
+                # Check for inactive IPs
+                for ip in list(ip_activity.keys()):
+                    if current_time - ip_activity[ip]['last_seen'] > UPDATE_INTERVAL:
+                        if ip_activity[ip]['active']:
+                            metrics['ip_bandwidth'][ip]['bytes'] = 0
                             ip_activity[ip]['active'] = False
 
-                # Clean up IPs yang sudah tidak aktif untuk waktu lama
+                # Clean up inactive IPs every 10 minutes
                 if current_time - last_cleanup >= INACTIVITY_TIMEOUT:
                     inactive_ips = [ip for ip, data in ip_activity.items()
                                   if current_time - data['last_seen'] >= INACTIVITY_TIMEOUT]
                     for ip in inactive_ips:
                         del ip_activity[ip]
-                        if ip in metrics['ip_bandwidth']:
-                            del metrics['ip_bandwidth'][ip]
                     last_cleanup = current_time
 
                 # Write metrics
                 write_metrics(metrics, current_time)
 
-                # Reset metrics untuk interval berikutnya
+                # Reset metrics
                 metrics['ip_requests'].clear()
-
-                # Reset bandwidth metrics, jangan hapus entry untuk yang masih aktif
-                for ip in list(metrics['ip_bandwidth'].keys()):
+                for ip in metrics['ip_bandwidth']:
                     metrics['ip_bandwidth'][ip]['bytes'] = 0
-
-                # Reset bandwidth per channel
-                for channel in list(metrics['channel_bandwidth'].keys()):
-                    metrics['channel_bandwidth'][channel]['bytes'] = 0
-                    metrics['channel_bandwidth'][channel]['ips'].clear()
-
-                # Reset bandwidth per server_origin
-                for server_origin in list(metrics['server_origin_bandwidth'].keys()):
-                    metrics['server_origin_bandwidth'][server_origin]['bytes'] = 0
-                    metrics['server_origin_bandwidth'][server_origin]['ips'].clear()
-
-                # Reset bandwidth per channel dengan server_origin
-                for key in list(metrics['channel_server_origin_bandwidth'].keys()):
-                    metrics['channel_server_origin_bandwidth'][key]['bytes'] = 0
-                    metrics['channel_server_origin_bandwidth'][key]['ips'].clear()
-
-                # Reset access metrics
                 metrics['channel_access'].clear()
-                metrics['server_origin_access'].clear()
-                metrics['channel_server_origin_access'].clear()
 
                 last_update = current_time
 
@@ -464,8 +273,8 @@ def monitor_nginx_traffic():
     except Exception as e:
         print(f"Monitoring error: {e}")
     finally:
-        geoip_city_reader.close()
-        geoip_asn_reader.close()
+        city_reader.close()
+        asn_reader.close()
 
 if __name__ == "__main__":
     monitor_nginx_traffic()
